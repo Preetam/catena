@@ -13,8 +13,8 @@ import (
 )
 
 var (
-	maxPartitions    = 7
-	partitionModulus = 3600
+	maxPartitions    = 2 * 30    // 30 days
+	partitionModulus = 3600 * 12 // 12 hours
 )
 
 // DB is a handle to a catena database.

@@ -23,13 +23,17 @@ type memoryPartition struct {
 
 // memorySource is a metric source registered in memory.
 type memorySource struct {
-	name    string
+	name string
+
+	lock    sync.RWMutex
 	metrics []*memoryMetric
 }
 
 // memoryMetric is a metric in memory.
 type memoryMetric struct {
-	name   string
+	name string
+
+	lock   sync.RWMutex
 	points []Point
 }
 
@@ -80,8 +84,8 @@ func newMemoryPartition(log wal) (*memoryPartition, error) {
 // minTimestamp returns the minimum timestamp
 // value held by this partition.
 func (p *memoryPartition) minTimestamp() int64 {
-	p.lock.Lock()
-	defer p.lock.Unlock()
+	p.lock.RLock()
+	defer p.lock.RUnlock()
 
 	return p.minTS
 }
@@ -89,16 +93,16 @@ func (p *memoryPartition) minTimestamp() int64 {
 // maxTimestamp returns the maximum timestamp
 // value held by this partition.
 func (p *memoryPartition) maxTimestamp() int64 {
-	p.lock.Lock()
-	defer p.lock.Unlock()
+	p.lock.RLock()
+	defer p.lock.RUnlock()
 
 	return p.maxTS
 }
 
 // readOnly returns whether this partition is read only.
 func (p *memoryPartition) readOnly() bool {
-	p.lock.Lock()
-	defer p.lock.Unlock()
+	p.lock.RLock()
+	defer p.lock.RUnlock()
 	return p.ro
 }
 
@@ -118,9 +122,9 @@ func (p *memoryPartition) filename() string {
 // put adds rows to a partition.
 func (p *memoryPartition) put(rows Rows) error {
 	p.lock.Lock()
-	defer p.lock.Unlock()
 
 	if p.ro {
+		p.lock.Unlock()
 		return errorReadyOnlyPartition
 	}
 
@@ -135,8 +139,11 @@ func (p *memoryPartition) put(rows Rows) error {
 		_ = p.log.truncate()
 		// TODO: What happens if we can't truncate?!
 
+		p.lock.Unlock()
 		return err
 	}
+
+	p.lock.Unlock()
 
 	sources := map[string]map[string][]Point{}
 
@@ -168,6 +175,7 @@ func (p *memoryPartition) put(rows Rows) error {
 
 // addPoints adds points to the partition.
 func (p *memoryPartition) addPoints(source, metric string, points []Point) {
+	p.lock.Lock()
 	if len(p.sources) == 0 {
 		// This is the first point.
 		if len(points) > 0 {
@@ -222,6 +230,9 @@ func (p *memoryPartition) addPoints(source, metric string, points []Point) {
 
 	src = p.sources[sourceIndex]
 
+	p.lock.Unlock()
+	src.lock.Lock()
+
 	// Now we do essentially the same
 	// thing for the metric.
 	insertionPoint = -1
@@ -262,6 +273,8 @@ func (p *memoryPartition) addPoints(source, metric string, points []Point) {
 
 	met = src.metrics[metricIndex]
 
+	src.lock.Unlock()
+
 	// Insert the points in order.
 
 NEXT_POINT:
@@ -277,6 +290,8 @@ NEXT_POINT:
 		}
 
 		insertionPoint = -1
+
+		met.lock.Lock()
 
 		// We start from the end because the expected
 		// case is appending to the end.
@@ -309,6 +324,8 @@ NEXT_POINT:
 				met.points[insertionPoint:]...,
 			)...,
 		)
+
+		met.lock.Unlock()
 	}
 }
 
@@ -316,25 +333,32 @@ NEXT_POINT:
 // (source, metric) series within the [start, end] time range.
 func (p *memoryPartition) fetchPoints(source, metric string,
 	start, end int64) ([]Point, error) {
-	p.lock.Lock()
-	defer p.lock.Unlock()
+	p.lock.RLock()
 
 	if len(p.sources) == 0 {
+		p.lock.RUnlock()
 		return nil, errorSourceNotFound
 	}
+
+	p.lock.RUnlock()
 
 	points := []Point{}
 
 	timeRange := end - start
 
 	// Iterate through sources
-
+	p.lock.RLock()
 	for _, src := range p.sources {
 		if src.name == source {
-
+			p.lock.RUnlock()
 			// Iterate through metrics
+
+			src.lock.RLock()
 			for _, met := range src.metrics {
 				if met.name == metric {
+					src.lock.RUnlock()
+
+					met.lock.RLock()
 					// Iterate through points
 					for _, point := range met.points {
 						if point.Timestamp-start < 0 {
@@ -350,10 +374,12 @@ func (p *memoryPartition) fetchPoints(source, metric string,
 						}
 					}
 
+					met.lock.RUnlock()
 					break
 				}
 
 				if met.name > metric {
+					src.lock.RUnlock()
 					return nil, errorMetricNotFound
 				}
 			}
@@ -361,6 +387,7 @@ func (p *memoryPartition) fetchPoints(source, metric string,
 		}
 
 		if src.name > source {
+			p.lock.RUnlock()
 			return nil, errorSourceNotFound
 		}
 	}

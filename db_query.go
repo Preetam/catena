@@ -1,5 +1,9 @@
 package catena
 
+import (
+	"sync"
+)
+
 // A Series is an ordered set of points
 // for a source and metric over a range
 // of time.
@@ -35,8 +39,8 @@ type QueryResponse struct {
 // Query fetches series matching the QueryDescs
 // and returns a QueryResponse.
 func (db *DB) Query(descs []QueryDesc) QueryResponse {
-	db.partitionsLock.Lock()
-	defer db.partitionsLock.Unlock()
+	db.partitionsLock.RLock()
+	defer db.partitionsLock.RUnlock()
 
 	response := QueryResponse{
 		Series: []Series{},
@@ -47,63 +51,98 @@ func (db *DB) Query(descs []QueryDesc) QueryResponse {
 		metric string
 	}
 
+	results := make(chan Series, len(descs))
+
+	wg := sync.WaitGroup{}
+
+	wg.Add(len(descs))
+
 	for _, desc := range descs {
+		go db.fetchSeries(desc, results, &wg)
+	}
 
-		// Get list of partitions to query
-		partitions := []partition{}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
 
-		for _, part := range db.partitions {
-			if part.minTimestamp() >= desc.Start {
-				if part.minTimestamp() <= desc.End {
-					partitions = append(partitions, part)
-					continue
-				}
-			} else {
-				if part.maxTimestamp() >= desc.Start {
-					partitions = append(partitions, part)
-					continue
-				}
-			}
-		}
-
-		logger.Println("partitions to query:")
-		for _, part := range partitions {
-			logger.Println("  ", part.filename(),
-				"with ranges\n", "    ",
-				part.minTimestamp(), "-", part.maxTimestamp())
-		}
-
-		series := Series{
-			Source: desc.Source,
-			Metric: desc.Metric,
-		}
-
-		for _, part := range partitions {
-			logger.Println("querying", part.filename())
-			points, err := part.fetchPoints(desc.Source, desc.Metric, desc.Start, desc.End)
-			if err != nil {
-				logger.Println(err)
-				continue
-			}
-
-			if len(points) == 0 {
-				logger.Println()
-				continue
-			}
-
-			series.Points = append(series.Points, points...)
-		}
-
-		if len(series.Points) == 0 {
-			logger.Println()
-			continue
-		}
-
-		series.Start = series.Points[0].Timestamp
-		series.End = series.Points[len(series.Points)-1].Timestamp
-
+	for series := range results {
+		logger.Println("got series")
 		response.Series = append(response.Series, series)
 	}
 
 	return response
+}
+
+func (db *DB) fetchSeries(desc QueryDesc, outbound chan Series, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	// Get list of partitions to query
+	partitions := []partition{}
+
+	for _, part := range db.partitions {
+		logger.Println(part.minTimestamp(), part.maxTimestamp())
+		if part.minTimestamp() >= desc.Start {
+			if part.minTimestamp() <= desc.End {
+				partitions = append(partitions, part)
+				continue
+			}
+		} else {
+			if part.maxTimestamp() >= desc.Start {
+				partitions = append(partitions, part)
+				continue
+			}
+		}
+	}
+
+	logger.Println(db.partitions)
+
+	logger.Println("partitions to query:")
+	for _, part := range partitions {
+		logger.Println("  ", part.filename(),
+			"with ranges\n", "    ",
+			part.minTimestamp(), "-", part.maxTimestamp())
+	}
+
+	series := Series{
+		Source: desc.Source,
+		Metric: desc.Metric,
+	}
+
+	pointResults := []chan []Point{}
+
+	for _, part := range partitions {
+		result := make(chan []Point)
+		pointResults = append(pointResults, result)
+		go fetchPartitionPoints(part, desc, result)
+
+	}
+
+	for _, c := range pointResults {
+		points := <-c
+		if len(points) > 0 {
+			series.Points = append(series.Points, points...)
+		}
+	}
+
+	if len(series.Points) == 0 {
+		return
+	}
+
+	series.Start = series.Points[0].Timestamp
+	series.End = series.Points[len(series.Points)-1].Timestamp
+
+	outbound <- series
+}
+
+func fetchPartitionPoints(part partition, desc QueryDesc, outbound chan []Point) {
+	logger.Println("querying", part.filename())
+	points, err := part.fetchPoints(desc.Source, desc.Metric, desc.Start, desc.End)
+	if err != nil {
+		logger.Println(err)
+
+		outbound <- nil
+	}
+
+	outbound <- points
 }
